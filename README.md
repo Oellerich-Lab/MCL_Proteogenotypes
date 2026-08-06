@@ -29,7 +29,7 @@ Affiliations:\
 19  Institute for Medical Information Processing, Biometry, and Epidemiology (IBE), LMU Medizin, Ludwig-Maximilians-Universität München, Munich, Germany \
 20  Pettenkofer School of Public Health, Munich, Germany \
 21  Goethe University Frankfurt, Department of Medicine, Frankfurt am Main, Germany \
-22  Department of Medicine III, LMU University Hospital, Munich, Germany \
+22  Department of Medicine III, LMU University Hospital, Munich, Germany 
 
 23,24  These authors contributed equally\
 25  Lead contact
