@@ -1,0 +1,167 @@
+---
+title: "MCLPG_PG_inference"
+author: "jenssle"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries 
+
+```{r}
+library(tidyverse)
+library(MultiAssayExperiment)
+library(MOFA2)
+library(rhdf5)
+library(cola)
+library(RANN)
+```
+
+## Extract latent embedding
+
+Using MuVI, we integrated the processed RNA and protein expression data. Load the trained object. 
+
+```{r}
+#defne´the helper function to adjust the factor names
+load_muvi <- function(file) {
+  model <- load_model(file,
+    sort_factors = FALSE,
+    remove_inactive_factors = FALSE
+  )
+  factors_names(model) <- h5read(file, "/factors/group_0")
+  return(model)
+}
+
+muvimcl <- load_muvi("muvimcl.hdf5")
+```
+
+
+## Consensus graph-based clustering on this latent embedding
+
+Generate adjacency matrix.
+
+```{r}
+t_space <- get_factors(muvimcl, factors = "all")$group_0 %>%
+  as.data.frame() %>% as.matrix() %>% t()
+
+set.seed(42)
+
+snn <- RANN::nn2(t(t_space), k=15)$nn.idx
+
+
+adjacency_matrix <- matrix(0L, ncol(t_space), ncol(t_space))
+rownames(adjacency_matrix) <- colnames(adjacency_matrix) <- colnames(t_space)
+
+for(i in 1:ncol(t_space)) {
+    adjacency_matrix[i,colnames(t_space)[snn[i,]]] <- 1L
+}
+
+#check that rows add to k
+sum(adjacency_matrix[1,]) == 15
+table(apply(adjacency_matrix, 1, sum))
+```
+
+Iterative Leiden-alg based community detection
+
+```{r}
+#Retrieve names for labeling of the resulting leiden-communities x samples matrix
+Latent_space_prots1 <- get_factors(muvimcl, factors = "all")$group_0 %>%
+  as.data.frame() %>% tibble::rownames_to_column("Prot_id")
+
+ident_global <- data.frame(Prot_id = Latent_space_prots1$Prot_id)
+
+for(i in 1:1000) {
+
+set.seed(sample(1:1000,1))
+partition_new <- leiden(adjacency_matrix, 
+                        partition_type = c("RBConfigurationVertexPartition"), 
+                        resolution_parameter = 1, 
+                        n_iterations = -1L, 
+                        seed = sample(1:1000,1)
+                        )
+
+ident_partition <- cbind(Latent_space_prots1$Prot_id, partition_new) %>% as.data.frame()
+
+colnames(ident_partition) <- c("Prot_id", i)
+
+ident_global <- left_join(ident_global, ident_partition, by = "Prot_id")
+
+}
+
+#get rownames and transpose the resulting df
+ident_global <- ident_global %>%
+  column_to_rownames("Prot_id") %>%
+  t() %>%
+  as.data.frame() 
+
+#mutate all variables to numeric
+ident_global_m <- mutate_all(ident_global, function(x) as.numeric(as.character(x)))
+```
+
+Now, register the "take all" method for top values.
+
+```{r}
+register_top_value_methods(
+ 
+  all = function(mat) {
+    
+    all <- c(runif(n = nrow(mat), min = 1, max = 1))
+ 
+  }
+ 
+)
+```
+
+Second, register hclust on the basis of hamming distance.
+
+```{r}
+register_partition_methods(
+    hclust_hamming = function(mat, k) {
+      
+      library(tidyverse)
+      library(e1071)
+      
+      mat_fac <- mutate_all(as.data.frame(mat),as.factor)
+        
+      
+      ham_dist_fac <- e1071::hamming.distance(as.matrix(t(mat_fac)))
+      
+      res_clust <- cutree(hclust(as.dist(ham_dist_fac)), k)
+      
+      res_clust
+    }
+)
+```
+
+Run the iterative clustering of the generated leiden matrix.
+
+```{r}
+res <- consensus_partition(
+  as.matrix(ident_global_m),
+  top_value_method = c("all"),
+  partition_method = c("hclust_hamming"),
+  mc.cores = 30,
+  top_n = nrow(ident_global_m),
+  max_k = max(ident_global_m),
+  scale_rows = FALSE
+  )
+```
+
+Collect the best k suggestion.
+
+```{r}
+suggest_best_k(res)
+
+select_partition_number(res)
+```
+
+Extract the MCL-PG final assignment.
+
+```{r}
+res_class <- get_classes(res, k=8) %>%
+  rownames_to_column("dbnr")
+```
+
