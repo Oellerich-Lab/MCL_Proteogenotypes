@@ -1,0 +1,281 @@
+---
+title: "MCL somatic mutation analysis"
+author: "Moritz Gräf"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Load libraries
+
+```{r libraries}
+library(tidyverse)
+library(vcfR)
+```
+
+## Input files and filter settings
+
+The upstream processing was performed with PeifLyne v0.7.0 using GRCh37/hg19.
+This document contains only the post-processing of somatic SNVs and small
+InDels. 
+
+```{r input}
+# Define paths relative to the analysis directory.
+sample_file <- "lists/samples_orange.txt"
+vcf_directory <- "snv/peiflyne/mutcall_filtered"
+vep_file <- "snv/vep_alphamissense/muts_pass_am_gnomad_most_severe_variants.vcf"
+microsec_directory <- "microsec/output"
+output_file <- "results/snv_indels/reproducible/snv_indel_per_sample.csv"
+
+write_outputs <- TRUE
+
+sample_list <- read_lines(sample_file)
+
+minimum_vaf <- 0.10
+maximum_gnomad_af <- 0.01
+maximum_cohort_frequency <- 0.05
+maximum_variants_per_gene <- 2L
+
+hotspot_genes <- c("NSD2", "TP53", "ATM", "MEF2B", "SMARCA4")
+
+stopifnot(length(sample_list) == 181L)
+```
+
+## Helper functions
+
+```{r functions}
+normalize_chromosome <- function(x) {
+  x <- as.character(x)
+  if_else(str_starts(x, "chr"), x, paste0("chr", x))
+}
+
+normalize_gene_symbol <- function(x) {
+  recode(as.character(x), WHSC1 = "NSD2")
+}
+
+# Read PASS variants from one PeifLyne VCF.
+read_mutations <- function(sample_id) {
+  file <- file.path(
+    vcf_directory,
+    paste0(sample_id, "_mutcall_filtered.vcf")
+  )
+
+  vcf <- read.vcfR(file, verbose = FALSE)
+  fixed <- as_tibble(vcf@fix, .name_repair = "minimal")
+  info <- extract_info_tidy(
+    vcf,
+    info_fields = c("DP", "DP_N", "AF", "AF_N", "FR", "TG")
+  )
+
+  bind_cols(fixed, info) %>%
+    transmute(
+      sample_id = as.character(sample_id),
+      CHROM = normalize_chromosome(CHROM),
+      POS = as.integer(POS),
+      ID = na_if(as.character(ID), "."),
+      REF = as.character(REF),
+      ALT = as.character(ALT),
+      QUAL = suppressWarnings(as.numeric(QUAL)),
+      FILTER = as.character(FILTER),
+      AF = suppressWarnings(as.numeric(AF)),
+      DP = as.integer(DP),
+      AF_N = suppressWarnings(as.numeric(AF_N)),
+      DP_N = as.integer(DP_N),
+      FR = suppressWarnings(as.numeric(FR)),
+      TG = as.character(TG)
+    ) %>%
+    # Keep the residual dbSNP-ID screen used in the source analysis.
+    filter(FILTER == "PASS", is.na(ID)) %>%
+    distinct(sample_id, CHROM, POS, REF, ALT, .keep_all = TRUE)
+}
+
+# Read the VEP v110, gnomAD v2.1, and AlphaMissense annotations.
+read_vep_annotation <- function(file) {
+  vcf <- read.vcfR(file, verbose = FALSE)
+  fixed <- as_tibble(vcf@fix, .name_repair = "minimal")
+  csq <- extract_info_tidy(vcf, info_fields = "CSQ")$CSQ
+
+  csq_names <- c(
+    "Consequence", "Biotype", "Impact", "Existing_variation", "Codons",
+    "Amino_acids", "Gene", "Symbol", "Feature", "EXON", "INTRON",
+    "Protein_position", "Allele", "am_pathogenicity", "am_class",
+    "gnomADe_AF", "gnomADe_NFE_AF", "HGVSc", "HGVSp"
+  )
+
+  bind_cols(fixed, tibble(CSQ = csq)) %>%
+    transmute(
+      CHROM = normalize_chromosome(CHROM),
+      POS = as.integer(POS),
+      REF = as.character(REF),
+      ALT = as.character(ALT),
+      CSQ
+    ) %>%
+    separate_rows(CSQ, sep = ",") %>%
+    separate(
+      CSQ,
+      into = csq_names,
+      sep = "\\|",
+      fill = "right",
+      extra = "merge"
+    ) %>%
+    mutate(
+      across(all_of(csq_names), ~ na_if(.x, "")),
+      gene_symbol = normalize_gene_symbol(Symbol),
+      am_pathogenicity = suppressWarnings(as.numeric(am_pathogenicity)),
+      gnomADe_AF = suppressWarnings(as.numeric(gnomADe_AF)),
+      gnomADe_NFE_AF = suppressWarnings(as.numeric(gnomADe_NFE_AF))
+    ) %>%
+    distinct(CHROM, POS, REF, ALT, .keep_all = TRUE)
+}
+
+# Read MicroSEC classifications for all retained samples.
+read_microsec <- function(samples) {
+  map_dfr(samples, function(sample_id) {
+    read_tsv(
+      file.path(
+        microsec_directory,
+        paste0("MicroSEC_", sample_id, ".tsv")
+      ),
+      col_types = cols(.default = col_character()),
+      progress = FALSE
+    ) %>%
+      select(Sample, Chr, Pos, Ref, Alt, msec_filter_all)
+  }) %>%
+    transmute(
+      sample_id = as.character(Sample),
+      CHROM = normalize_chromosome(Chr),
+      POS = as.integer(Pos),
+      REF = as.character(Ref),
+      ALT = as.character(Alt),
+      microsec_result = msec_filter_all,
+      microsec_artifact = str_detect(
+        coalesce(msec_filter_all, ""),
+        fixed("Artifact suspicious")
+      )
+    ) %>%
+    distinct(sample_id, CHROM, POS, REF, ALT, .keep_all = TRUE)
+}
+```
+
+## Read and annotate mutations
+
+```{r read-mutations}
+muts <- map_dfr(sample_list, read_mutations)
+vep <- read_vep_annotation(vep_file)
+microsec <- read_microsec(sample_list)
+
+muts_annotated <- muts %>%
+  left_join(
+    vep,
+    by = c("CHROM", "POS", "REF", "ALT"),
+    relationship = "many-to-one"
+  ) %>%
+  left_join(
+    microsec,
+    by = c("sample_id", "CHROM", "POS", "REF", "ALT"),
+    relationship = "many-to-one"
+  )
+```
+
+## Filter mutations
+
+```{r filter-mutations}
+retained_consequences <- c(
+  "transcript_ablation",
+  "splice_acceptor_variant",
+  "splice_donor_variant",
+  "stop_gained",
+  "frameshift_variant",
+  "stop_lost",
+  "start_lost",
+  "transcript_amplification",
+  "inframe_insertion",
+  "inframe_deletion",
+  "missense_variant",
+  "protein_altering_variant"
+)
+
+final_mut_matrix_per_sample <- muts_annotated %>%
+  filter(
+    !is.na(Consequence),
+    !is.na(gene_symbol),
+    Biotype %in% c("protein_coding", "nonsense_mediated_decay")
+  ) %>%
+  filter(
+    map_lgl(
+      str_split(Consequence, fixed("&")),
+      ~ any(.x %in% retained_consequences)
+    )
+  ) %>%
+  filter(is.na(gnomADe_AF) | gnomADe_AF < maximum_gnomad_af) %>%
+  filter(!is.na(AF), AF > minimum_vaf) %>%
+  filter(!coalesce(microsec_artifact, FALSE)) %>%
+  group_by(CHROM, POS, REF, ALT) %>%
+  mutate(
+    cohort_frequency = n_distinct(sample_id) / length(sample_list)
+  ) %>%
+  ungroup() %>%
+  filter(
+    cohort_frequency < maximum_cohort_frequency |
+      gene_symbol %in% hotspot_genes
+  ) %>%
+  group_by(sample_id, gene_symbol) %>%
+  mutate(variants_in_gene = n_distinct(paste(CHROM, POS, REF, ALT))) %>%
+  ungroup() %>%
+  filter(
+    variants_in_gene <= maximum_variants_per_gene |
+      gene_symbol %in% hotspot_genes
+  ) %>%
+  mutate(
+    variant_class = if_else(
+      nchar(REF) == 1L & nchar(ALT) == 1L,
+      "SNV",
+      "indel"
+    )
+  ) %>%
+  arrange(sample_id, CHROM, POS, REF, ALT)
+```
+
+## Check and export results
+
+```{r check-results}
+stopifnot(
+  !anyDuplicated(
+    final_mut_matrix_per_sample[c("sample_id", "CHROM", "POS", "REF", "ALT")]
+  ),
+  all(final_mut_matrix_per_sample$AF > minimum_vaf),
+  all(
+    is.na(final_mut_matrix_per_sample$gnomADe_AF) |
+      final_mut_matrix_per_sample$gnomADe_AF < maximum_gnomad_af
+  ),
+  !any(final_mut_matrix_per_sample$microsec_artifact, na.rm = TRUE)
+)
+
+result_summary <- final_mut_matrix_per_sample %>%
+  summarise(
+    samples = n_distinct(sample_id),
+    mutations = n(),
+    SNVs = sum(variant_class == "SNV"),
+    indels = sum(variant_class == "indel")
+  )
+
+result_summary
+```
+
+```{r write-results}
+if (write_outputs) {
+  dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+  write_csv(final_mut_matrix_per_sample, output_file)
+}
+```
+
+```{r session-info}
+sessionInfo()
+```
